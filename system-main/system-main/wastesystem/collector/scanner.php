@@ -1,4 +1,3 @@
-
 <?php
 session_start();
 include "../config/database.php";
@@ -47,20 +46,23 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         $qr_data = trim($_POST["qr_data"] ?? "");
 
-        if (!preg_match('/^RESIDENT\s*-\s*(\d+)$/i', $qr_data, $matches)) {
+        // Accept QR codes such as RESIDENT - 2 or RESIDENT-2
+        if (!preg_match('/^RESIDENT\s*-\s*([1-9][0-9]*)$/i', $qr_data, $matches)) {
             respond(false, "Invalid resident QR code.");
         }
 
         $resident_id = (int) $matches[1];
 
+        // Get resident information
         $stmt = mysqli_prepare($conn, "
             SELECT
                 u.id,
                 u.fullname,
+                u.users,
                 h.id AS household_id,
                 h.house_address,
                 s.subscription_status,
-                s.payment_status
+                s.payment_status AS subscription_payment_status
             FROM users u
             LEFT JOIN households h ON h.user_id = u.id
             LEFT JOIN subscriptions s ON s.user_id = u.id
@@ -70,7 +72,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         ");
 
         if (!$stmt) {
-            respond(false, "Database error while checking resident.");
+            respond(false, "Database error while checking resident: " . mysqli_error($conn));
         }
 
         mysqli_stmt_bind_param($stmt, "i", $resident_id);
@@ -78,28 +80,75 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         $result = mysqli_stmt_get_result($stmt);
         $resident = mysqli_fetch_assoc($result);
+
         mysqli_stmt_close($stmt);
 
         if (!$resident) {
             respond(false, "Resident account not found.");
         }
 
-        if (empty($resident["household_id"])) {
-            respond(false, "This resident has not registered a household.");
+        // Get latest payment record, like the resident dashboard
+        $payment_stmt = mysqli_prepare($conn, "
+            SELECT amount, status, paid_at
+            FROM resident_payments
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+
+        if (!$payment_stmt) {
+            respond(false, "Unable to retrieve payment information: " . mysqli_error($conn));
         }
 
-        if (
-            $resident["subscription_status"] !== "Active" ||
-            $resident["payment_status"] !== "Paid"
-        ) {
-            respond(false, "This resident has not paid for an active subscription. Collection is blocked.");
+        mysqli_stmt_bind_param($payment_stmt, "i", $resident_id);
+        mysqli_stmt_execute($payment_stmt);
+
+        $payment_result = mysqli_stmt_get_result($payment_stmt);
+        $payment = mysqli_fetch_assoc($payment_result);
+
+        mysqli_stmt_close($payment_stmt);
+
+        // Set default payment information
+        $payment_status = "UNPAID";
+        $payment_amount = "0.00";
+        $paid_at = "No payment recorded";
+
+        if ($payment) {
+            if (strtolower(trim($payment["status"])) === "paid") {
+                $payment_status = "PAID";
+            } else {
+                $payment_status = strtoupper(trim($payment["status"]));
+            }
+
+            $payment_amount = number_format((float) $payment["amount"], 2);
+
+            if (!empty($payment["paid_at"])) {
+                $paid_at = date(
+                    "F d, Y h:i A",
+                    strtotime($payment["paid_at"])
+                );
+            }
         }
 
-        respond(true, "Resident verified successfully.", [
+        // Check if the resident can proceed with collection
+        $can_collect = (
+            !empty($resident["household_id"]) &&
+            $resident["subscription_status"] === "Active" &&
+            $resident["subscription_payment_status"] === "Paid" &&
+            $payment_status === "PAID"
+        );
+
+        respond(true, "Resident QR code recognized successfully.", [
             "resident_id" => $resident["id"],
             "fullname" => $resident["fullname"],
+            "username" => $resident["users"],
             "household_id" => $resident["household_id"],
-            "house_address" => $resident["house_address"]
+            "house_address" => $resident["house_address"] ?? "No household address registered",
+            "subscription_status" => $resident["subscription_status"] ?? "No subscription",
+            "payment_status" => $payment_status,
+            "payment_amount" => $payment_amount,
+            "paid_at" => $paid_at,
+            "can_collect" => $can_collect
         ]);
     }
 
@@ -124,7 +173,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         try {
 
-            // Recheck resident and subscription on the server
+            // Recheck resident and subscription
             $stmt = mysqli_prepare($conn, "
                 SELECT
                     u.id,
@@ -149,6 +198,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             $result = mysqli_stmt_get_result($stmt);
             $resident = mysqli_fetch_assoc($result);
+
             mysqli_stmt_close($stmt);
 
             if (
@@ -157,6 +207,34 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 $resident["payment_status"] !== "Paid"
             ) {
                 throw new Exception("Resident subscription is inactive or unpaid. Collection is blocked.");
+            }
+
+            // Recheck latest payment record before collection
+            $payment_stmt = mysqli_prepare($conn, "
+                SELECT status
+                FROM resident_payments
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            ");
+
+            if (!$payment_stmt) {
+                throw new Exception("Unable to verify payment.");
+            }
+
+            mysqli_stmt_bind_param($payment_stmt, "i", $resident_id);
+            mysqli_stmt_execute($payment_stmt);
+
+            $payment_result = mysqli_stmt_get_result($payment_stmt);
+            $payment = mysqli_fetch_assoc($payment_result);
+
+            mysqli_stmt_close($payment_stmt);
+
+            if (
+                !$payment ||
+                strtolower(trim($payment["status"])) !== "paid"
+            ) {
+                throw new Exception("No paid payment record found. Collection is blocked.");
             }
 
             $household_id = (int) $resident["household_id"];
@@ -192,7 +270,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             );
 
             if (!mysqli_stmt_execute($stmt)) {
-                if (mysqli_errno($conn) == 1062) {
+                if (mysqli_stmt_errno($stmt) == 1062) {
                     throw new Exception("This household has already been recorded as collected today.");
                 }
 
@@ -296,6 +374,27 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         #resident-result {
             display: none;
+            text-align: left;
+        }
+
+        .payment-box {
+            padding: 15px;
+            border-radius: 10px;
+            margin: 15px 0;
+        }
+
+        .paid {
+            background: #d1e7dd;
+            color: #0f5132;
+        }
+
+        .unpaid {
+            background: #f8d7da;
+            color: #842029;
+        }
+
+        .info-table th {
+            width: 40%;
         }
     </style>
 </head>
@@ -317,7 +416,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         <h3 class="text-success">Resident QR Scanner</h3>
 
         <p class="text-muted">
-            Scan the resident's QR code to verify their subscription.
+            Scan the resident's QR code to view resident and payment information.
         </p>
 
         <div id="reader"></div>
@@ -330,42 +429,75 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             <hr>
 
-            <h4 class="text-success">Resident Verified</h4>
+            <h4 class="text-success text-center">Resident Information</h4>
 
-            <p class="mb-1">
-                <strong>Name:</strong>
-                <span id="resident-name"></span>
-            </p>
+            <table class="table table-bordered info-table">
+                <tr>
+                    <th>Resident ID</th>
+                    <td id="resident-id"></td>
+                </tr>
+                <tr>
+                    <th>Full Name</th>
+                    <td id="resident-name"></td>
+                </tr>
+                <tr>
+                    <th>Username</th>
+                    <td id="resident-username"></td>
+                </tr>
+                <tr>
+                    <th>Household ID</th>
+                    <td id="household-id"></td>
+                </tr>
+                <tr>
+                    <th>House Address</th>
+                    <td id="resident-address"></td>
+                </tr>
+                <tr>
+                    <th>Subscription Status</th>
+                    <td id="subscription-status"></td>
+                </tr>
+            </table>
 
-            <p class="mb-3">
-                <strong>House Address:</strong>
-                <span id="resident-address"></span>
-            </p>
+            <h4 class="text-success text-center mt-4">Payment Information</h4>
 
-            <p class="text-success">
-                <strong>Subscription:</strong> Active and Paid
-            </p>
+            <div id="payment-box" class="payment-box unpaid text-center">
+                <h3 id="payment-status">UNPAID</h3>
+                <p class="mb-1">Payment Amount</p>
+                <h2 id="payment-amount">₱0.00</h2>
+                <p class="mb-0">Date Paid: <span id="payment-date">No payment recorded</span></p>
+            </div>
 
-            <hr>
+            <div id="collection-section" style="display:none;">
 
-            <h5>Waste Segregation Assessment</h5>
+                <hr>
+
+                <h5 class="text-success text-center">Waste Segregation Assessment</h5>
+
+                <button
+                    type="button"
+                    class="btn btn-success w-100 mb-2"
+                    onclick="recordCollection('Properly Segregated')"
+                >
+                    Properly Segregated (+10 Eco-Points)
+                </button>
+
+                <button
+                    type="button"
+                    class="btn btn-warning w-100 mb-2"
+                    onclick="recordCollection('Not Properly Segregated')"
+                >
+                    Not Properly Segregated (No Points)
+                </button>
+
+            </div>
+
+            <div id="collection-blocked" class="alert alert-warning">
+                Collection cannot proceed because the subscription is inactive or the payment is unpaid.
+            </div>
 
             <button
-                class="btn btn-success w-100 mb-2"
-                onclick="recordCollection('Properly Segregated')"
-            >
-                Properly Segregated (+10 Eco-Points)
-            </button>
-
-            <button
-                class="btn btn-warning w-100 mb-2"
-                onclick="recordCollection('Not Properly Segregated')"
-            >
-                Not Properly Segregated (No Points)
-            </button>
-
-            <button
-                class="btn btn-outline-success w-100"
+                type="button"
+                class="btn btn-outline-success w-100 mt-2"
                 onclick="resetScanner()"
             >
                 Back to Scanner
@@ -414,19 +546,23 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         const response = await fetch("scanner.php", {
             method: "POST",
-            body: formData
+            body: formData,
+            credentials: "same-origin"
         });
 
         return await response.json();
     }
 
     async function startScanner() {
-        scanner = new Html5Qrcode("reader");
-
         try {
+            scanner = new Html5Qrcode("reader");
+
             await scanner.start(
                 { facingMode: "environment" },
-                { fps: 10, qrbox: { width: 250, height: 250 } },
+                {
+                    fps: 10,
+                    qrbox: { width: 250, height: 250 }
+                },
                 handleScan
             );
 
@@ -435,7 +571,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         } catch (error) {
             showMessage(
-                "Unable to access camera. Please allow camera permission and use localhost or HTTPS.",
+                "Unable to access camera. Please allow camera permission.",
                 "danger"
             );
         }
@@ -447,10 +583,12 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         busy = true;
 
         try {
-            await scanner.stop();
-            scannerRunning = false;
+            if (scannerRunning) {
+                await scanner.stop();
+                scannerRunning = false;
+            }
 
-            showMessage("Checking resident subscription...", "info");
+            showMessage("Recognizing resident QR code...", "info");
 
             const response = await sendRequest({
                 action: "verify",
@@ -459,23 +597,50 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             if (!response.success) {
                 showMessage(response.message, "danger");
+                busy = false;
                 setTimeout(resetScanner, 2500);
                 return;
             }
 
-            residentId = response.data.resident_id;
+            const data = response.data;
 
-            document.getElementById("resident-name").textContent =
-                response.data.fullname;
+            residentId = data.resident_id;
 
-            document.getElementById("resident-address").textContent =
-                response.data.house_address;
+            document.getElementById("resident-id").textContent = data.resident_id;
+            document.getElementById("resident-name").textContent = data.fullname;
+            document.getElementById("resident-username").textContent = data.username || "Not available";
+            document.getElementById("household-id").textContent = data.household_id || "Not registered";
+            document.getElementById("resident-address").textContent = data.house_address;
+            document.getElementById("subscription-status").textContent = data.subscription_status;
+
+            document.getElementById("payment-status").textContent = data.payment_status;
+            document.getElementById("payment-amount").textContent = "₱" + data.payment_amount;
+            document.getElementById("payment-date").textContent = data.paid_at;
+
+            const paymentBox = document.getElementById("payment-box");
+
+            if (data.payment_status === "PAID") {
+                paymentBox.className = "payment-box paid text-center";
+            } else {
+                paymentBox.className = "payment-box unpaid text-center";
+            }
+
+            document.getElementById("collection-section").style.display =
+                data.can_collect ? "block" : "none";
+
+            document.getElementById("collection-blocked").style.display =
+                data.can_collect ? "none" : "block";
 
             result.style.display = "block";
             message.style.display = "none";
 
         } catch (error) {
-            showMessage("Something went wrong. Please try again.", "danger");
+            showMessage(
+                "Unable to verify resident. Please check your database and try again.",
+                "danger"
+            );
+
+            busy = false;
             setTimeout(resetScanner, 2500);
         }
     }
@@ -483,10 +648,11 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     async function recordCollection(status) {
         if (!residentId) return;
 
-        const buttons = document.querySelectorAll("#resident-result button");
+        const buttons = document.querySelectorAll("#collection-section button");
         buttons.forEach(button => button.disabled = true);
 
         showMessage("Saving collection record...", "info");
+        message.style.display = "block";
 
         try {
             const response = await sendRequest({
@@ -518,6 +684,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
         result.style.display = "none";
         message.style.display = "block";
+        document.getElementById("reader").innerHTML = "";
 
         if (scanner && scannerRunning) {
             try {
@@ -532,8 +699,6 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 await scanner.clear();
             } catch (error) {}
         }
-
-        document.getElementById("reader").innerHTML = "";
 
         startScanner();
     }

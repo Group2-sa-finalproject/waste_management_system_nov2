@@ -274,7 +274,7 @@ $admin_name = $admin["fullname"];
                             Review Feedback
                         </a>
 
-                        <a href="pickup_requests/index.php"
+                        <a href="special_pickup_requests.php"
                             class="btn btn-outline-success">
                             <i class="bi bi-truck me-1"></i>
                             Pickup Requests
