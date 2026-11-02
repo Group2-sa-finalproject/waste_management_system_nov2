@@ -283,6 +283,32 @@ $admin_name = $admin["fullname"];
                     </div>
                 </div>
             </div>
+            
+<!-- Manage Pickup Schedule -->
+<div class="col-md-6 col-lg-4">
+    <div class="card dashboard-card">
+        <div class="card-body">
+
+            <div class="dashboard-icon">
+                <i class="bi bi-calendar-week"></i>
+            </div>
+
+            <h5>Pickup Schedule</h5>
+
+            <p>
+                Create, update, and manage garbage collection schedules
+                for registered households.
+            </p>
+
+            <a href="pickup_schedule.php" class="btn btn-success">
+                <i class="bi bi-calendar-check me-1"></i>
+                Manage Pickup Schedule
+            </a>
+
+        </div>
+    </div>
+</div>
+
 
             <!-- Subscriptions and Payments -->
             <div class="col-md-6 col-lg-4">
